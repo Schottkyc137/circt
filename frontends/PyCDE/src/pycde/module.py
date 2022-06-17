@@ -91,6 +91,63 @@ def _create_module_name(name: str, params: mlir.ir.DictAttr):
   return ret.strip("_")
 
 
+def create_msft_module_op(sys, mod: _SpecializedModule, symbol):
+  """Creation callback for creating a MSFTModuleOp."""
+  return msft.MSFTModuleOp(symbol,
+                           mod.input_ports,
+                           mod.output_ports,
+                           mod.parameters,
+                           loc=mod.loc,
+                           ip=sys._get_ip())
+
+
+def generate_msft_module_op(generate_obj: Generator,
+                            spec_mod: _SpecializedModule):
+
+  def create_output_op(args: _GeneratorPortAccess):
+    """Create the hw.OutputOp from module I/O ports in 'args'."""
+    output_ports = spec_mod.output_ports
+    outputs: list[Value] = list()
+
+    unconnected_ports = []
+    for (name, _) in output_ports:
+      if name not in args._output_values:
+        unconnected_ports.append(name)
+        outputs.append(None)
+      else:
+        outputs.append(args._output_values[name])
+    if len(unconnected_ports) > 0:
+      raise support.UnconnectedSignalError(unconnected_ports)
+
+    msft.OutputOp([o.value for o in outputs])
+
+  bc = _BlockContext()
+  entry_block = spec_mod.circt_mod.add_entry_block()
+  with mlir.ir.InsertionPoint(
+      entry_block), generate_obj.loc, BackedgeBuilder(), bc:
+    args = _GeneratorPortAccess(spec_mod)
+    outputs = generate_obj.gen_func(args)
+    if outputs is not None:
+      raise ValueError("Generators must not return a value")
+    create_output_op(args)
+
+
+def create_msft_module_extern_op(sys, mod: _SpecializedModule, symbol):
+  """Creation callback for creating a MSFTModuleExternOp."""
+  paramdecl_list = [
+      hw.ParamDeclAttr.get_nodefault(i.name, mlir.ir.TypeAttr.get(i.attr.type))
+      for i in mod.parameters
+  ]
+  return msft.MSFTModuleExternOp(
+      symbol,
+      mod.input_ports,
+      mod.output_ports,
+      parameters=paramdecl_list,
+      attributes={"verilogName": mlir.ir.StringAttr.get(mod.extern_name)},
+      loc=mod.loc,
+      ip=sys._get_ip())
+
+
 class _SpecializedModule:
   """SpecializedModule serves two purposes:
 
@@ -104,7 +161,8 @@ class _SpecializedModule:
 
   __slots__ = [
       "name", "generators", "modcls", "loc", "input_ports", "input_port_lookup",
-      "output_ports", "output_port_lookup", "parameters", "extern_name"
+      "output_ports", "output_port_lookup", "parameters", "extern_name",
+      "create_cb", "generator_cb"
   ]
 
   def __init__(self, cls: type, parameters: Union[dict, mlir.ir.DictAttr],
@@ -112,6 +170,13 @@ class _SpecializedModule:
     self.modcls = cls
     self.extern_name = extern_name
     self.loc = get_user_loc()
+
+    # Set creation callback if not already set. At this point, we assume that
+    # a MSFTModuleLike operation is to be created, and discern based on whether
+    # an extern name has been provided.
+    if not hasattr(self.modcls, "create_cb"):
+      raise NotImplementedError(
+          f"Missing module creation callback in class {self.modcls.__name__}")
 
     # Make sure 'parameters' is a DictAttr rather than a python value.
     self.parameters = _obj_to_attribute(parameters)
@@ -147,7 +212,7 @@ class _SpecializedModule:
         attr.name = attr_name
         self.output_ports.append((attr.name, attr.type))
         self.output_port_lookup[attr_name] = len(self.output_ports) - 1
-      elif isinstance(attr, _Generate):
+      elif isinstance(attr, Generator):
         self.generators[attr_name] = attr
     self.add_accessors()
 
@@ -172,35 +237,9 @@ class _SpecializedModule:
     """Create the module op. Should not be called outside of a 'System'
     context. Returns the symbol of the module op."""
 
-    # Callback from System.
-    def _create(symbol):
-      if self.extern_name is None:
-        return msft.MSFTModuleOp(symbol,
-                                 self.input_ports,
-                                 self.output_ports,
-                                 self.parameters,
-                                 loc=self.loc,
-                                 ip=sys._get_ip())
-      else:
-        paramdecl_list = [
-            hw.ParamDeclAttr.get_nodefault(i.name,
-                                           mlir.ir.TypeAttr.get(i.attr.type))
-            for i in self.parameters
-        ]
-        return msft.MSFTModuleExternOp(
-            symbol,
-            self.input_ports,
-            self.output_ports,
-            parameters=paramdecl_list,
-            attributes={
-                "verilogName": mlir.ir.StringAttr.get(self.extern_name)
-            },
-            loc=self.loc,
-            ip=sys._get_ip())
-
     from .system import System
     sys = System.current()
-    sys._create_circt_mod(self, _create)
+    sys._create_circt_mod(self, self.modcls.create_cb)
 
   @property
   def is_created(self):
@@ -227,7 +266,7 @@ class _SpecializedModule:
     currently."""
     assert len(self.generators) == 1
     for g in self.generators.values():
-      g.generate(self)
+      self.modcls.generator_cb(g, self)
       return
 
   def print(self, out):
@@ -246,6 +285,10 @@ def module(func_or_class):
   function should be treated as a module parameterization function. In the
   latter case, the function must return a python class to be treated as the
   parameterized module."""
+  if not hasattr(func_or_class, 'create_cb'):
+    func_or_class.create_cb = create_msft_module_op
+  if not hasattr(func_or_class, 'generator_cb'):
+    func_or_class.generator_cb = generate_msft_module_op
   if inspect.isclass(func_or_class):
     # If it's just a module class, we should wrap it immediately
     return _module_base(func_or_class, None)
@@ -321,7 +364,7 @@ class _parameterized_module:
 def externmodule(to_be_wrapped, extern_name=None):
   """Wrap an externally implemented module. If no name given in the decorator
   argument, use the class name."""
-
+  to_be_wrapped.create_cb = create_msft_module_extern_op
   if isinstance(to_be_wrapped, str):
     return lambda cls, extern_name=to_be_wrapped: externmodule(cls, extern_name)
 
@@ -458,9 +501,12 @@ class _BlockContext:
     return ret
 
 
-class _Generate:
-  """Represents a generator. Stores the generate function and wraps it with the
-  necessary logic to build a module."""
+class Generator:
+  """
+  Represents a generator. Stores the generate function and location of
+  the generate call. Generator objects are passed to module-specific generator
+  object handlers.
+  """
 
   def __init__(self, gen_func):
     sig = inspect.signature(gen_func)
@@ -471,39 +517,10 @@ class _Generate:
     self.gen_func = gen_func
     self.loc = get_user_loc()
 
-  def generate(self, specialized_mod: _SpecializedModule):
-    """Build an HWModuleOp and run the generator as the body builder."""
-
-    bc = _BlockContext()
-    entry_block = specialized_mod.circt_mod.add_entry_block()
-    with mlir.ir.InsertionPoint(entry_block), self.loc, BackedgeBuilder(), bc:
-      args = _GeneratorPortAccess(specialized_mod)
-      outputs = self.gen_func(args)
-      if outputs is not None:
-        raise ValueError("Generators must not return a value")
-      self._create_output_op(args, specialized_mod)
-
-  def _create_output_op(self, args: _GeneratorPortAccess, spec_mod):
-    """Create the hw.OutputOp from module I/O ports in 'args'."""
-    output_ports = spec_mod.output_ports
-    outputs: list[Value] = list()
-
-    unconnected_ports = []
-    for (name, _) in output_ports:
-      if name not in args._output_values:
-        unconnected_ports.append(name)
-        outputs.append(None)
-      else:
-        outputs.append(args._output_values[name])
-    if len(unconnected_ports) > 0:
-      raise support.UnconnectedSignalError(unconnected_ports)
-
-    msft.OutputOp([o.value for o in outputs])
-
 
 def generator(func):
   """Decorator for generation functions."""
-  return _Generate(func)
+  return Generator(func)
 
 
 class _GeneratorPortAccess:
@@ -519,7 +536,8 @@ class _GeneratorPortAccess:
   def __getattr__(self, name):
     if name in self._mod.input_port_lookup:
       idx = self._mod.input_port_lookup[name]
-      val = self._mod.circt_mod.entry_block.arguments[idx]
+      entry_block = self._mod.circt_mod.regions[0].blocks[0]
+      val = entry_block.arguments[idx]
       return Value(val)
     if name in self._mod.output_port_lookup:
       if name not in self._output_values:

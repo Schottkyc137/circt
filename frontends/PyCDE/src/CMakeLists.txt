@@ -25,6 +25,7 @@ declare_mlir_python_sources(PyCDESources
     pycde/instance.py
     pycde/value.py
     pycde/ndarray.py
+    pycde/fsm.py
 )
 
 add_mlir_python_modules(PyCDE

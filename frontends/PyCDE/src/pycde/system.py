@@ -102,11 +102,11 @@ class System:
       return
 
     # Build the correct op.
-    op = create_cb(symbol)
+    op = create_cb(self, spec_mod, symbol)
     # Install the op in the cache.
     install_func(op)
     # Add to the generation queue, if necessary.
-    if isinstance(op, circt.dialects.msft.MSFTModuleOp):
+    if hasattr(spec_mod.modcls, 'generator_cb'):
       self._generate_queue.append(spec_mod)
       file_name = spec_mod.modcls.__name__ + ".sv"
       self.files.add(os.path.join(self._output_directory, file_name))
