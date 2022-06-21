@@ -57,6 +57,37 @@ class MachineOp:
   def type(self):
     return FunctionType(TypeAttr(self.attributes["function_type"]).value)
 
+  def instantiate(self, name: str, loc=None, ip=None, **kwargs):
+    """ FSM Instantiation function"""
+    in_names = support.attribute_to_var(self.attributes['in_names'])
+    inputs = [kwargs[port].value for port in in_names]
+
+    # Clock and resets are not part of the input ports of the FSM, but
+    # it is at the point of `fsm.hw_instance` instantiation that they
+    # are connected.
+    # Attach backedges to these, and associate these backedges to the operation.
+    # They can then be accessed at the point of instantiation and assigned.
+    clock = support.BackedgeBuilder().create(
+        IntegerType.get_signed(1),
+        StringAttr(self.attributes['clock_name']).value, self)
+    reset = None
+    if 'reset_name' in self.attributes:
+      reset = support.BackedgeBuilder().create(
+          IntegerType.get_signed(1),
+          StringAttr(self.attributes['reset_name']).value, self)
+
+    op = fsm.HWInstanceOp(outputs=self.type.results,
+                          inputs=inputs,
+                          sym_name=StringAttr.get(name),
+                          machine=self.sym_name,
+                          clock=clock.result,
+                          reset=reset.result if reset else None,
+                          loc=loc,
+                          ip=ip)
+    setattr(op, '_clock_backedge', clock)
+    setattr(op, '_reset_backedge', reset)
+    return op
+
 
 class TransitionOp:
 

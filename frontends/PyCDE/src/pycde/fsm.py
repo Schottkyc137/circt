@@ -45,24 +45,19 @@ def _index_of_first(lst, pred):
 
 
 def create_fsm_machine_op(sys, mod: _SpecializedModule, symbol):
-  """Creation callback for creating a MSFTModuleOp."""
+  """Creation callback for creating a FSM MachineOp."""
 
-  # Add attributes for in- and outputs.
+  # Add attributes for in- and output names.
   attributes = {}
   attributes["in_names"] = _obj_to_attribute(
       [port_name for port_name, _ in mod.input_ports])
   attributes["out_names"] = _obj_to_attribute(
-      [port_name for port_name, _ in mod.input_ports])
+      [port_name for port_name, _ in mod.output_ports])
 
-  # Add attributes to indicate whether the FSM has explicit clock and reset
-  # signals. This attribute indicates the input port index of the signal.
-  attributes['has_clock'] = _obj_to_attribute(
-      _index_of_first(mod.input_ports, lambda p: p[0] == mod.modcls.clock_name))
-
-  if mod.modcls.reset_name is not None:
-    attributes['has_reset'] = _obj_to_attribute(
-        _index_of_first(mod.input_ports,
-                        lambda p: p[0] == mod.modcls.reset_name))
+  # Add attributes for clock and reset names.
+  attributes["clock_name"] = _obj_to_attribute(mod.modcls.clock_name)
+  if mod.modcls.reset_name:
+    attributes["reset_name"] = _obj_to_attribute(mod.modcls.reset_name)
 
   return fsm.MachineOp(symbol,
                        mod.modcls.fsm_initial_state,
@@ -71,6 +66,10 @@ def create_fsm_machine_op(sys, mod: _SpecializedModule, symbol):
                        attributes=attributes,
                        loc=mod.loc,
                        ip=sys._get_ip())
+
+
+class FSMPortAccess:
+  """Get the ports of an FSM machine."""
 
 
 def generate_fsm_machine_op(generate_obj: Generator,
@@ -85,6 +84,9 @@ def generate_fsm_machine_op(generate_obj: Generator,
     with InsertionPoint(entry_block):
       return types.i1(v)
 
+  # Prime the cache. This is a super minor nit, but being explicit about the
+  # ordering here ensures that %0 = False and %1 = True in the IR as well as
+  # constants being emitted before the FSM ops.
   get_cached_bool(False)
   get_cached_bool(True)
 
@@ -101,6 +103,63 @@ def generate_fsm_machine_op(generate_obj: Generator,
       # Emit outgoing transitions from this state.
       for transition in state_transitions:
         transition.emit(state_op, ports)
+
+
+"""
+FSM wrapping example:  
+
+
+Given a simple FSM like below:
+```
+@fsm.machine()
+class MyFSM:
+  a = Input(types.i1)
+  b = Input(types.i1)
+  fsm_transitions = {
+    a:(b, lambda ports : ports.a),b:a
+  }
+```
+
+This will, via. the @fsm.machine() decorator, be elaborated to:
+```
+@module
+class MyFSM:
+
+  a = Input(types.i1)
+  b = Input(types.i1)
+  clk = Input(types.i1)
+
+  is_a = Output(types.i1)
+  is_b = Output(types.i1)
+
+  @fsm.machine()
+  class _MyFSM:
+    a = Input(types.i1)
+    b = Input(types.i1)
+    fsm_transitions = {
+        "a": ("b", lambda ports: ports.a),
+        "b": ("a", lambda ports: ports.b)
+    }
+
+  @generator
+  def construct(ports):
+    # fsm.hw_instance operation
+    myfsm = MyFSM(clk=ports.clk, a=ports.a, b=ports.b)
+    ports.is_a = myfsm.is_a
+    ports.is_b = myfsm.is_b
+```
+
+The reason for this wrapper is to have a method of exposing the as-of-yet
+unmaterialized clock and reset (CR) ports of an FSM to the instantiater of MyFSM.
+If we instead added CR ports directly to _MyFSM, we would have to do a lot of
+special-case logic for eliding these in the PyCDE module helper functions
+(e.g. specializing GeneratorPortAccess, module.input_port_lookup, ...).
+
+Through the wrapper, we control the instantiation of MyFSM, and can automatically
+hook up the CR ports to the correct inputs of the fsm.hw_instance operation.
+
+
+  """
 
 
 def machine(clock: str = 'clk', reset: str = None):
@@ -154,13 +213,9 @@ def machine(clock: str = 'clk', reset: str = None):
     for state in states:
       setattr(to_be_wrapped, 'is_' + state, Output(types.i1))
 
+    # Store requested clock and reset names.
     to_be_wrapped.clock_name = clock
     to_be_wrapped.reset_name = reset
-
-    # Create clock and optional reset signals
-    setattr(to_be_wrapped, clock, Input(types.i1))
-    if reset is not None:
-      setattr(to_be_wrapped, reset, Input(types.i1))
 
     # Create Transition objects.
     transitions = defaultdict(lambda: [])
@@ -193,6 +248,19 @@ def machine(clock: str = 'clk', reset: str = None):
     # @generator function specified by the user if they want to do something
     # specific.
     setattr(to_be_wrapped, 'dummy_generator_f', generator(lambda x: None))
+
+    # Create an __init__ function that allows clk and reset signals to pass through
+    # legally.
+    def init_cr_passthrough(*args, **kwargs):
+      cr_names = [clock]
+      if reset is not None:
+        cr_names.append(reset)
+      for k, _ in kwargs.items():
+        if k not in cr_names:
+          raise ValueError("Input which doesn't have a port: {}".format(k))
+      return
+
+    setattr(to_be_wrapped, '__init__', init_cr_passthrough)
 
     # Treat the remainder of the class as a module.
     return module(to_be_wrapped)

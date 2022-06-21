@@ -254,12 +254,12 @@ class _SpecializedModule:
   def instantiate(self, instance_name: str, inputs: dict, loc):
     """Create a instance op."""
     if self.extern_name is None:
-      return self.circt_mod.create(instance_name, **inputs, loc=loc)
+      return self.circt_mod.instantiate(instance_name, **inputs, loc=loc)
     else:
-      return self.circt_mod.create(instance_name,
-                                   **inputs,
-                                   parameters=self.parameters,
-                                   loc=loc)
+      return self.circt_mod.instantiate(instance_name,
+                                        **inputs,
+                                        parameters=self.parameters,
+                                        loc=loc)
 
   def generate(self):
     """Fill in (generate) this module. Only supports a single generator
@@ -397,8 +397,10 @@ def _module_base(cls, extern_name: str, params={}):
       pass_up_kwargs = {n: v for (n, v) in kwargs.items() if n not in inputs}
       if len(pass_up_kwargs) > 0:
         init_sig = inspect.signature(cls.__init__)
-        if not any(
-            [x == inspect.Parameter.VAR_KEYWORD for x in init_sig.parameters]):
+        if not any([
+            x.kind == inspect.Parameter.VAR_KEYWORD
+            for x in init_sig.parameters.values()
+        ]):
           raise ValueError("Module constructor doesn't have a **kwargs"
                            " parameter, so the following are likely inputs"
                            " which don't have a port: " +
