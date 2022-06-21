@@ -24,12 +24,11 @@ class MachineOp:
                input_ports,
                output_ports,
                *,
+               attributes={},
                loc=None,
                ip=None):
-    attributes = {
-        "sym_name": FlatSymbolRefAttr.get(name),
-        "initialState": FlatSymbolRefAttr.get(initial_state)
-    }
+    attributes["sym_name"] = StringAttr.get(name)
+    attributes["initialState"] = StringAttr.get(initial_state)
 
     input_types = []
     output_types = []

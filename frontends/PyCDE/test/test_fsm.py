@@ -1,16 +1,17 @@
 # RUN: py-split-input-file.py %s
 
 from re import A
-from pycde import System, Input, Output, module, generator, externmodule
+from pycde import System, Input, module, generator, externmodule
 
 from pycde.dialects import comb
 from pycde import fsm
 from pycde.pycde_types import types, dim
-from pycde.value import ListValue
 
 
-@fsm.machine
-class M1:
+# Create an FSM.
+# 'clock' name is mandatory, 'reset' name is optional.
+@fsm.machine(clock="clock")
+class F0:
   a = Input(types.i1)
   c = Input(types.i1)
   d = Input(types.i1)
@@ -40,6 +41,6 @@ class M1:
   }
 
 
-m1 = System([M1])
+m1 = System([F0])
 m1.generate()
 m1.print()
